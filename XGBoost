@@ -1,0 +1,96 @@
+import warnings, numpy as np, pandas as pd, os
+warnings.filterwarnings("ignore")
+
+from sklearn.model_selection import KFold, cross_val_score
+from sklearn.metrics import mean_squared_error
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.impute import SimpleImputer
+from xgboost import XGBRegressor
+
+def find_file(filename):
+    for root, dirs, files in os.walk('/kaggle/input'):
+        if filename in files:
+            return os.path.join(root, filename)
+    raise FileNotFoundError(filename)
+
+train = pd.read_csv(find_file('train.csv'))
+test  = pd.read_csv(find_file('test.csv'))
+
+TARGET = 'property_value_score'
+ID_COL = 'id'
+
+y = train[TARGET].astype(float)
+X = train.drop(columns=[TARGET])
+X_test = test.copy()
+
+num_cols = X.select_dtypes(include=['number']).columns.tolist()
+if ID_COL in num_cols:
+    num_cols.remove(ID_COL)
+cat_cols = [c for c in X.columns if c not in num_cols and c != ID_COL]
+
+numeric_tf = Pipeline([('imputer', SimpleImputer(strategy='median'))])
+categorical_tf = Pipeline([('imputer', SimpleImputer(strategy='most_frequent')),
+                           ('ohe', OneHotEncoder(handle_unknown='ignore'))])
+
+transformers = []
+if len(num_cols) > 0:
+    transformers.append(('num', numeric_tf, num_cols))
+if len(cat_cols) > 0:
+    transformers.append(('cat', categorical_tf, cat_cols))
+preprocess = ColumnTransformer(transformers)
+
+def rmse_scorer(y_true, y_pred):
+    return mean_squared_error(y_true, np.clip(y_pred, 0, 100), squared=False)
+
+param_list = [
+    dict(n_estimators=800,  learning_rate=0.05, max_depth=6, subsample=0.8, colsample_bytree=0.8),
+    dict(n_estimators=1200, learning_rate=0.04, max_depth=6, subsample=0.8, colsample_bytree=0.8),
+    dict(n_estimators=1200, learning_rate=0.03, max_depth=7, subsample=0.9, colsample_bytree=0.9),
+    dict(n_estimators=1600, learning_rate=0.03, max_depth=6, subsample=0.9, colsample_bytree=0.8),
+    dict(n_estimators=2000, learning_rate=0.025,max_depth=6, subsample=0.9, colsample_bytree=0.8),
+]
+
+base_fixed = dict(
+    min_child_weight=1.0,
+    reg_alpha=0.0,
+    reg_lambda=1.0,
+    objective='reg:squarederror',
+    tree_method='hist',
+    random_state=42,
+    n_jobs=-1
+)
+
+cv = KFold(n_splits=5, shuffle=True, random_state=42)
+
+cv_results = []
+for i, p in enumerate(param_list):
+    xgb_params = {**base_fixed, **p}
+    model = XGBRegressor(**xgb_params)
+    pipe = Pipeline([('prep', preprocess), ('model', model)])
+    scores = cross_val_score(
+        pipe,
+        X.drop(columns=[ID_COL], errors='ignore'),
+        y,
+        cv=cv,
+        scoring='neg_root_mean_squared_error'
+    )
+    mean_rmse = -scores.mean()
+    std_rmse = scores.std()
+    cv_results.append((mean_rmse, std_rmse, xgb_params))
+    print("set", i, "RMSE", mean_rmse, "STD", std_rmse)
+
+best_idx = np.argmin([r[0] for r in cv_results])
+best_mean, best_std, best_params = cv_results[best_idx]
+print("best set", best_idx, "RMSE", best_mean, "STD", best_std)
+
+final_model = XGBRegressor(**best_params)
+final_pipe = Pipeline([('prep', preprocess), ('model', final_model)])
+final_pipe.fit(X.drop(columns=[ID_COL], errors='ignore'), y)
+pred = final_pipe.predict(X_test.drop(columns=[ID_COL], errors='ignore'))
+pred = np.clip(pred, 0, 100)
+
+sub = pd.DataFrame({ID_COL: X_test[ID_COL], TARGET: pred})
+sub.to_csv('submission.csv', index=False)
+print("Saved submission.csv")
